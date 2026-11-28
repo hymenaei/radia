@@ -7,7 +7,7 @@ use std::{
 
 use math::{DVec3, Quat, Vec3};
 use uuid::Uuid;
-use wgpu::{Device, DeviceDescriptor, TextureFormat};
+use wgpu::{CommandEncoderDescriptor, Device, DeviceDescriptor, TextureFormat};
 use world::{
     Appearance, FaceAppearance, FieldUpdate, Kind, ObjectObservation, OrderEvidence, ParentUpdate, Pose, PrimShape, Region, RegionInfo,
     Shape, SurfaceAppearance, UpdateSource, World, WorldLimits,
@@ -270,6 +270,105 @@ fn rebuild_finalizes_under_visibility_churn() {
     assert!(!settled.rebuild_pending, "a quiet frame after the rebuild starts no new work");
     let live = usize::try_from(count - removed).expect("live count fits usize");
     assert_eq!(geometry.cache.objects.len(), live, "every removed object leaves the cache once the scene settles");
+}
+
+#[test]
+fn layout_commits_under_removal_churn() {
+    let (device, queue) = Device::noop(&DeviceDescriptor::default());
+    let mut geometry = GeometryRenderer::new(&device, &queue, TextureFormat::Rgba8UnormSrgb, Limits::default());
+    let count = 1_500_u32;
+    let (mut world, region, mut scene, mut view) = removable_object_scene(count, 1_024);
+    let camera = Camera::new(DVec3::ZERO, Vec3::X, 1.0, [128, 128]).expect("fixture camera");
+    let frame = |geometry: &mut GeometryRenderer, view: &SceneView| {
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        geometry.prepare(&device, &mut encoder, view, None, camera, [128, 128], None);
+    };
+
+    let expected = usize::try_from(count).expect("count fits usize");
+    for _ in 0..10_000 {
+        frame(&mut geometry, &view);
+        if geometry.cache.visible.len() == expected
+            && geometry.draw_list.valid()
+            && !geometry.stats.layout_pending
+            && !geometry.stats.rebuild_active
+            && !geometry.stats.rebuild_pending
+            && geometry.stats.pending_meshes == 0
+            && !geometry.layout_required
+        {
+            break;
+        }
+    }
+    assert!(geometry.draw_list.valid(), "initial scene settles to a valid layout");
+    assert!(!geometry.stats.layout_pending, "initial scene finishes its layout");
+    assert_eq!(geometry.cache.visible.len(), expected, "every fixture object becomes visible");
+
+    let committed_before = geometry.layout_counts.committed;
+    let entering_id = count + 1;
+    let mut observation = ObjectObservation::new(
+        UpdateSource::new(region, entering_id, OrderEvidence::Ordered(u64::from(entering_id)), 0),
+        Uuid::from_u128(u128::from(entering_id)),
+        NonZeroU32::new(entering_id).expect("entering local id"),
+        Kind::Object,
+        ParentUpdate::Root,
+    );
+    observation.pose = Some(Pose { position: Some(Vec3::new(10.0, 0.0, 0.0)), rotation: Some(Quat::IDENTITY) });
+    observation.scale = Some(Vec3::ONE);
+    observation.shape = FieldUpdate::Set(Shape::Prim(PrimShape::default()));
+    observation.appearance = FieldUpdate::Set(Appearance::Surface);
+    observation.surface_appearance = Some(SurfaceAppearance::new(FaceAppearance::default(), Vec::new()).expect("fixture appearance"));
+    let _ = world.observe_object(observation).expect("entering object applies");
+    scene.notify_world_change();
+    fixtures::settle(&world, &mut scene, &mut view);
+
+    frame(&mut geometry, &view);
+    assert!(geometry.stats.layout_pending, "entering item starts a multi-frame layout");
+
+    let mut removed_meshes = Vec::new();
+    for turn in 1..=1_000_u32 {
+        if !geometry.stats.layout_pending {
+            break;
+        }
+        let target_uuid = Uuid::from_u128(u128::from(turn));
+        let target = view.objects().find(|object| object.detail().summary.id == target_uuid).expect("visible object exists");
+        let entity = target.detail().summary.entity;
+        let mesh_id = target.mesh().expect("object has mesh").1.id();
+        let cached_index = geometry.cache.objects.get(&entity).copied().expect("object is cached");
+        assert!(geometry.cache.visible.contains(&cached_index), "removed object is currently visible");
+        removed_meshes.push(mesh_id);
+
+        let order = u64::from(entering_id) + u64::from(turn);
+        let _ = world
+            .remove_object(
+                UpdateSource::new(region, entering_id + turn, OrderEvidence::Ordered(order), 0),
+                NonZeroU32::new(turn).expect("removed local id"),
+            )
+            .expect("object removal applies");
+        scene.notify_world_change();
+        fixtures::settle(&world, &mut scene, &mut view);
+
+        frame(&mut geometry, &view);
+        if geometry.layout_counts.committed > committed_before {
+            break;
+        }
+    }
+
+    assert!(!removed_meshes.is_empty(), "at least one visible object was removed while layout was pending");
+    assert!(
+        geometry.layout_counts.committed > committed_before,
+        "layout must commit under removal churn (committed: {}, stale: {}, pending: {})",
+        geometry.layout_counts.committed,
+        geometry.layout_counts.stale,
+        geometry.stats.layout_pending
+    );
+    assert_eq!(geometry.layout_counts.stale, 0, "removals must not stale a pending layout");
+    for mesh_id in removed_meshes {
+        for draw in geometry.draw_list.draws().iter().filter(|draw| draw.mesh == mesh_id) {
+            for slot in draw.first..draw.first + draw.count {
+                let transform = geometry.draw_list.instance_transform(slot).expect("committed draw slot has transform bytes");
+                assert!(transform.iter().all(|byte| *byte == 0), "removed object mesh {mesh_id:?} still draws at slot {slot}");
+            }
+        }
+    }
 }
 
 fn removable_object_scene(count: u32, tombstones: usize) -> (World, Region, Reconciler, SceneView) {

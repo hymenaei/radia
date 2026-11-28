@@ -251,7 +251,7 @@ impl GeometryRenderer {
         let rebuilding = update.rebuild_pending;
         let stale_pass = update.rebuild_completed && range_moved(candidate_camera, camera);
         if self.draw_list.layout_pending() && (update.immediate_visibility_change || update.layout_invalidated) {
-            self.draw_list.mark_layout_stale();
+            self.layout_required = true;
         }
         let frame_origin = if rebuilding { self.cache.origin } else { origin };
         let origin_rebased = !rebuilding && self.cache.origin != origin;
@@ -431,8 +431,12 @@ impl GeometryRenderer {
                 }
             }
         }
-        if self.draw_list.layout_pending() && (update.layout_invalidated || origin_rebased) {
-            self.draw_list.mark_layout_stale();
+        if self.draw_list.layout_pending() {
+            if origin_rebased {
+                self.draw_list.mark_layout_stale();
+            } else if update.layout_invalidated {
+                self.layout_required = true;
+            }
         }
         if layout_requested {
             self.layout_counts.visibility_resets += u64::from(update.immediate_visibility_change);

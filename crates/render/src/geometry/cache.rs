@@ -1284,7 +1284,7 @@ impl GeometryRenderer {
             };
             let live = item_is_live(view, item);
             if !live {
-                draw_list.hide_item(item);
+                draw_list.hide_item(*index, item);
             } else {
                 visible_items += usize::from(item.faces.iter().any(|face| face.slot.is_some()));
             }
@@ -1708,8 +1708,9 @@ impl GeometryRenderer {
 
     fn remove_item(&mut self, index: ItemIndex, update: &mut CacheUpdate, immediate_visibility: bool) -> Option<CachedItem> {
         let (mut item, was_visible) = self.cache.remove_item(index)?;
+        self.draw_list.forget_item(index);
         if was_visible && immediate_visibility {
-            self.draw_list.hide_item(&mut item);
+            self.draw_list.hide_item(index, &mut item);
         }
         update.immediate_visibility_change |= was_visible && immediate_visibility;
         update.layout_invalidated |= was_visible && immediate_visibility;

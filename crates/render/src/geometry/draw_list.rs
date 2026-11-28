@@ -470,6 +470,7 @@ struct LayoutBuild {
     state: LayoutState,
     uploads: HashSet<u32>,
     visible: Vec<ItemIndex>,
+    removed: HashSet<ItemIndex>,
     evicted: HashSet<MeshId>,
     layout_items: Vec<ItemIndex>,
     selected_items: HashSet<ItemIndex>,
@@ -523,6 +524,7 @@ impl LayoutBuild {
             state: LayoutState::default(),
             uploads: HashSet::new(),
             visible: visible.to_vec(),
+            removed: HashSet::new(),
             evicted: HashSet::new(),
             layout_items: Vec::new(),
             selected_items: HashSet::new(),
@@ -829,9 +831,12 @@ impl DrawList {
                         }
                         continue;
                     };
-                    let Some(item) = items.get(index) else {
-                        build.item_cells.push(u32::MAX);
+                    let Some(item) = items.get(index).filter(|_| !build.removed.contains(&index)) else {
+                        if build.face_cursor == 0 {
+                            build.item_cells.push(u32::MAX);
+                        }
                         build.item_cursor += 1;
+                        build.face_cursor = 0;
                         continue;
                     };
                     if build.face_cursor == 0 {
@@ -878,7 +883,7 @@ impl DrawList {
                     build.item_cursor += 1;
                     items_visited += 1;
                     build.items_visited += 1;
-                    let Some(item) = items.get(index) else { continue };
+                    let Some(item) = items.get(index).filter(|_| !build.removed.contains(&index)) else { continue };
                     let (priority, distance) = draw_priority(item, build.camera);
                     build.priority.push(PriorityItem { priority, distance, id: item.id, index, faces: item.faces.len() });
                 }
@@ -918,8 +923,9 @@ impl DrawList {
                         items_visited += 1;
                         build.items_visited += 1;
                     }
-                    let Some(item) = items.get_mut(index) else {
+                    let Some(item) = items.get_mut(index).filter(|_| !build.removed.contains(&index)) else {
                         build.item_cursor += 1;
+                        build.face_cursor = 0;
                         continue;
                     };
                     if build.face_cursor >= item.faces.len() {
@@ -1006,7 +1012,7 @@ impl DrawList {
                         continue;
                     };
                     let cell = build.item_cells.get(build.item_cursor).copied().unwrap_or(u32::MAX);
-                    let Some(item) = items.get_mut(index) else {
+                    let Some(item) = items.get_mut(index).filter(|_| !build.removed.contains(&index)) else {
                         build.item_cursor += 1;
                         build.face_cursor = 0;
                         build.item_has_slot = false;
@@ -1080,6 +1086,9 @@ impl DrawList {
                         build.phase = LayoutPhase::Commit;
                         continue;
                     };
+                    if build.removed.contains(&blended.item) {
+                        continue;
+                    }
                     let Some(item) = items.get_mut(blended.item) else {
                         build.stale = true;
                         continue;
@@ -1546,10 +1555,17 @@ impl DrawList {
         }
     }
 
-    pub(super) fn hide_item(&mut self, item: &mut CachedItem) {
+    pub(super) fn forget_item(&mut self, index: ItemIndex) {
+        if let Some(build) = self.pending.as_mut() {
+            build.removed.insert(index);
+        }
+    }
+
+    pub(super) fn hide_item(&mut self, index: ItemIndex, item: &mut CachedItem) {
+        self.forget_item(index);
         let mut hidden = false;
         for face in &mut item.faces {
-            hidden |= self.hide_face(face);
+            hidden |= self.clear_face_slot(face);
         }
         if hidden {
             debug_assert!(self.committed.visible_items > 0);
@@ -1562,6 +1578,26 @@ impl DrawList {
             && face.layout == build.layout
         {
             build.stale = true;
+        }
+        self.clear_face_slot(face)
+    }
+
+    fn clear_face_slot(&mut self, face: &mut CachedFace) -> bool {
+        if let Some(build) = self.pending.as_mut()
+            && !build.stale
+            && face.layout == build.layout
+            && let Some(slot) = face.slot
+        {
+            let start = slot as usize * INSTANCE_BYTES;
+            if let Some(instance) = build.state.instance_bytes.get_mut(start..start + INSTANCE_BYTES) {
+                instance.fill(0);
+                build.upload(slot);
+            }
+            if let Some(blended_index) = face.blended_index
+                && let Some(draw) = build.state.draws.get_mut(build.state.opaque_draws.saturating_add(blended_index))
+            {
+                draw.live = false;
+            }
         }
         let committed = self.committed_address(face);
         face.slot = None;
